@@ -1,0 +1,1327 @@
+From 0aac8e8cfe33da75e24d15d5d8ee740f796f6153 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Oskari=20Yl=C3=B6nen?= <oskari.ylonen@iki.fi>
+Date: Wed, 7 Oct 2026 23:06:18 +0300
+Subject: [PATCH] cycle: add DirectionalCycleWindows action
+
+Allow spatial window selection using north, south, east and west bindings.
+Rank content centers by distance along the requested axis, perpendicular
+distance and activation order. Include minimized windows and keep the
+selection unchanged when no candidate exists.
+
+Show a themed outline without raising windows during selection. Disable
+key repeat, cancel on Escape or selected-window destruction, and commit
+when all modifiers are released. Run the initiating binding's finalactions,
+defaulting to Focus, Raise and Unshade. Cancel before configuration reload
+so the borrowed action list cannot outlive its configuration.
+
+Add geometry tests and a headless Wayland integration client covering
+navigation, modifier release, cancellation, finalactions and Alt-Tab.
+Both test paths pass with address and undefined behavior sanitizers.
+---
+ docs/labwc-actions.5.scd           |  44 ++++
+ include/action.h                   |   1 +
+ include/cycle-directional.h        |  31 +++
+ include/cycle.h                    |   9 +
+ include/view.h                     |   1 +
+ meson.build                        |   2 +-
+ src/action.c                       |  43 +++-
+ src/config/rcxml.c                 |   7 +
+ src/cycle/cycle.c                  | 118 +++++++++-
+ src/cycle/directional.c            |  61 +++++
+ src/cycle/meson.build              |   1 +
+ src/input/keyboard.c               |  10 +-
+ src/server.c                       |   3 +-
+ src/view-impl-common.c             |   5 +
+ src/view.c                         |   4 +
+ t/directional-cycle-client.c       | 359 +++++++++++++++++++++++++++++
+ t/directional-cycle-integration.py | 116 ++++++++++
+ t/directional-cycle.c              | 118 ++++++++++
+ t/meson.build                      |  11 +
+ 19 files changed, 939 insertions(+), 5 deletions(-)
+ create mode 100644 include/cycle-directional.h
+ create mode 100644 src/cycle/directional.c
+ create mode 100644 t/directional-cycle-client.c
+ create mode 100644 t/directional-cycle-integration.py
+ create mode 100644 t/directional-cycle.c
+
+diff --git a/docs/labwc-actions.5.scd b/docs/labwc-actions.5.scd
+index 53e40a20..9e343841 100644
+--- a/docs/labwc-actions.5.scd
++++ b/docs/labwc-actions.5.scd
+@@ -129,6 +129,50 @@ Actions are used in menus and keyboard/mouse bindings.
+ 	Resize and move the active window back to its untiled or unmaximized
+ 	position if it had been maximized or tiled to a direction or region.
+ 
++*<action name="DirectionalCycleWindows" direction="north" />*
++	Select windows spatially while the binding's modifiers are held. Supported
++	directions are *north*, *south*, *east*, and *west*. Each key press moves
++	from the selected window (initially the focused window). Holding the key
++	does not repeat. If there is no focused window, nothing happens.
++
++	Windows are located by their content center in desktop coordinates.
++	North/south selects the nearest strictly smaller/larger Y coordinate;
++	east/west uses X. Ties prefer the smallest distance along the other axis,
++	then the most recently focused window. Equal coordinates on the requested
++	axis are excluded. There is no wrapping: no candidate leaves the selection
++	unchanged. Window overlap and visibility do not affect the ordering.
++
++	Candidates include minimized windows and windows on the current workspace
++	(including omnipresent windows), across all outputs. Panels and desktop
++	windows are excluded. A thick outline shows the selection, using the
++	window-switcher preview border colors and a minimum border width of 2.
++	Windows are not raised or restored during selection; a minimized window's
++	outline marks its retained position. No switcher dialog is displayed.
++
++	Releasing all modifiers commits the selection. Escape cancels without
++	running final actions. Closing the selected window cancels selection too.
++	NextWindow/PreviousWindow are ignored during directional selection.
++
++	*finalactions*: Nested actions to run on the selected window, in order.
++	If omitted, defaults to *Focus*, *Raise*, *Unshade*. An explicit list
++	replaces the defaults, and an empty list runs nothing. The binding which
++	starts selection supplies the final actions for the entire selection.
++
++	Example:
++
++```
++<keybind key="W-Up">
++  <action name="DirectionalCycleWindows">
++    <direction>north</direction>
++    <finalactions>
++      <action name="Focus" />
++      <action name="Raise" />
++      <action name="Unshade" />
++    </finalactions>
++  </action>
++</keybind>
++```
++
+ *<action name="NextWindow" workspace="current" output="all" identifier="all" />*++
+ *<action name="PreviousWindow" workspace="current" output="all" identifier="all" />*++
+ *<action name="NextWindowImmediate" workspace="current" output="all" identifier="all" />*++
+diff --git a/include/action.h b/include/action.h
+index b09aa35c..354a3a1c 100644
+--- a/include/action.h
++++ b/include/action.h
+@@ -38,6 +38,7 @@ struct wl_list *action_get_querylist(struct action *action, const char *key);
+ void action_arg_from_xml_node(struct action *action, const char *nodename, const char *content);
+ 
+ bool actions_contain_toggle_keybinds(struct wl_list *action_list);
++bool actions_contain_directional_cycle(struct wl_list *action_list);
+ 
+ /**
+  * actions_run() - Run actions.
+diff --git a/include/cycle-directional.h b/include/cycle-directional.h
+new file mode 100644
+index 00000000..c0d003c1
+--- /dev/null
++++ b/include/cycle-directional.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef LABWC_CYCLE_DIRECTIONAL_H
++#define LABWC_CYCLE_DIRECTIONAL_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <wlr/util/box.h>
++
++enum lab_directional_cycle_dir {
++	LAB_DIRECTIONAL_CYCLE_NORTH,
++	LAB_DIRECTIONAL_CYCLE_SOUTH,
++	LAB_DIRECTIONAL_CYCLE_EAST,
++	LAB_DIRECTIONAL_CYCLE_WEST,
++};
++
++struct directional_cycle_distance {
++	int64_t axis;
++	int64_t perpendicular;
++	uint64_t focus_id;
++};
++
++/* Centers are measured in half-pixels to preserve odd window sizes. */
++bool directional_cycle_get_distance(const struct wlr_box *from,
++	const struct wlr_box *to, enum lab_directional_cycle_dir direction,
++	uint64_t focus_id, struct directional_cycle_distance *distance);
++
++/* Prefer axis distance, then perpendicular distance, then recent focus. */
++bool directional_cycle_is_closer(const struct directional_cycle_distance *a,
++	const struct directional_cycle_distance *b);
++
++#endif /* LABWC_CYCLE_DIRECTIONAL_H */
+diff --git a/include/cycle.h b/include/cycle.h
+index 440b938f..c311a32c 100644
+--- a/include/cycle.h
++++ b/include/cycle.h
+@@ -6,6 +6,7 @@
+ #include <wayland-server-core.h>
+ #include <wlr/util/box.h>
+ #include "config/types.h"
++#include "cycle-directional.h"
+ 
+ struct output;
+ struct wlr_box;
+@@ -52,6 +53,10 @@ struct cycle_filter {
+ };
+ 
+ struct cycle_state {
++	bool directional;
++	/* Borrowed from the binding that started selection; cancelled on reload. */
++	struct wl_list *final_actions;
++	struct wl_listener selected_destroy;
+ 	struct view *selected_view;
+ 	struct wl_list views;
+ 	struct wl_list osd_outputs; /* struct cycle_osd_output.link */
+@@ -97,6 +102,10 @@ void cycle_begin(enum lab_cycle_dir direction,
+ /* Cycle the selected view in the window switcher */
+ void cycle_step(enum lab_cycle_dir direction);
+ 
++/* Begin or step spatial selection, without raising or restoring windows. */
++void cycle_directional(enum lab_directional_cycle_dir direction,
++	struct wl_list *final_actions);
++
+ /* Closes the OSD */
+ void cycle_finish(bool switch_focus);
+ 
+diff --git a/include/view.h b/include/view.h
+index 46943ab2..36f639c3 100644
+--- a/include/view.h
++++ b/include/view.h
+@@ -186,6 +186,7 @@ struct view {
+ 	bool mapped;
+ 	bool been_mapped;
+ 	uint64_t creation_id;
++	uint64_t focus_id; /* Monotonically increasing activation order */
+ 	enum lab_ssd_mode ssd_mode;
+ 	enum ssd_preference ssd_preference;
+ 	bool shaded;
+diff --git a/meson.build b/meson.build
+index 283cbb56..2e289e2a 100644
+--- a/meson.build
++++ b/meson.build
+@@ -194,7 +194,7 @@ subdir('docs')
+ subdir('clients')
+ 
+ dep_cmocka = dependency('cmocka', required: get_option('test'))
+-if dep_cmocka.found()
++if not get_option('test').disabled()
+   subdir('t')
+ endif
+ 
+diff --git a/src/action.c b/src/action.c
+index 4a1bd119..49b07723 100644
+--- a/src/action.c
++++ b/src/action.c
+@@ -87,6 +87,7 @@ struct action_arg_list {
+ 	X(PREVIOUS_WINDOW, "PreviousWindow") \
+ 	X(NEXT_WINDOW_IMMEDIATE, "NextWindowImmediate") \
+ 	X(PREVIOUS_WINDOW_IMMEDIATE, "PreviousWindowImmediate") \
++	X(DIRECTIONAL_CYCLE_WINDOWS, "DirectionalCycleWindows") \
+ 	X(RECONFIGURE, "Reconfigure") \
+ 	X(SHOW_MENU, "ShowMenu") \
+ 	X(TOGGLE_MAXIMIZE, "ToggleMaximize") \
+@@ -338,6 +339,20 @@ action_arg_from_xml_node(struct action *action, const char *nodename, const char
+ 			goto cleanup;
+ 		}
+ 		break;
++	case ACTION_TYPE_DIRECTIONAL_CYCLE_WINDOWS:
++		if (!strcasecmp(argument, "direction")) {
++			static const char *const names[] = { "north", "south", "east", "west" };
++			for (size_t i = 0; i < ARRAY_SIZE(names); ++i) {
++				if (!strcasecmp(content, names[i])) {
++					action_arg_add_int(action, argument, i);
++					goto cleanup;
++				}
++			}
++			nag_log(WLR_ERROR,
++				"Invalid direction for DirectionalCycleWindows: '%s'", content);
++			goto cleanup;
++		}
++		break;
+ 	case ACTION_TYPE_NEXT_WINDOW:
+ 	case ACTION_TYPE_PREVIOUS_WINDOW:
+ 	case ACTION_TYPE_NEXT_WINDOW_IMMEDIATE:
+@@ -593,6 +608,18 @@ actions_contain_toggle_keybinds(struct wl_list *action_list)
+ 	return false;
+ }
+ 
++bool
++actions_contain_directional_cycle(struct wl_list *actions)
++{
++	struct action *action;
++	wl_list_for_each(action, actions, link) {
++		if (action->type == ACTION_TYPE_DIRECTIONAL_CYCLE_WINDOWS) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ static bool
+ action_list_is_valid(struct wl_list *actions)
+ {
+@@ -610,7 +637,7 @@ action_list_is_valid(struct wl_list *actions)
+ static bool
+ action_branches_are_valid(struct action *action)
+ {
+-	static const char * const branches[] = { "then", "else", "none" };
++	static const char * const branches[] = { "then", "else", "none", "finalactions" };
+ 	for (size_t i = 0; i < ARRAY_SIZE(branches); i++) {
+ 		struct wl_list *children =
+ 			action_get_actionlist(action, branches[i]);
+@@ -656,6 +683,13 @@ action_is_valid(struct action *action)
+ 	case ACTION_TYPE_IF:
+ 	case ACTION_TYPE_FOR_EACH:
+ 		return action_branches_are_valid(action);
++	case ACTION_TYPE_DIRECTIONAL_CYCLE_WINDOWS:
++		if (!action_branches_are_valid(action)) {
++			return false;
++		}
++		arg_name = "direction";
++		arg_type = LAB_ACTION_ARG_INT;
++		break;
+ 	default:
+ 		/* No arguments required */
+ 		return true;
+@@ -1141,6 +1175,10 @@ run_action(struct view *view, struct action *action,
+ 			view_shrink_to_edge(view, edge);
+ 		}
+ 		break;
++	case ACTION_TYPE_DIRECTIONAL_CYCLE_WINDOWS:
++		cycle_directional(action_get_int(action, "direction", LAB_DIRECTIONAL_CYCLE_NORTH),
++			action_get_actionlist(action, "finalactions"));
++		break;
+ 	case ACTION_TYPE_NEXT_WINDOW:
+ 	case ACTION_TYPE_PREVIOUS_WINDOW: {
+ 		enum lab_cycle_dir dir = (action->type == ACTION_TYPE_NEXT_WINDOW) ?
+@@ -1637,8 +1675,11 @@ static bool
+ action_is_allowed_while_cycling(enum action_type type)
+ {
+ 	switch (type) {
++	case ACTION_TYPE_DIRECTIONAL_CYCLE_WINDOWS:
++		return server.cycle.directional;
+ 	case ACTION_TYPE_NEXT_WINDOW:
+ 	case ACTION_TYPE_PREVIOUS_WINDOW:
++		return !server.cycle.directional;
+ 	case ACTION_TYPE_CLOSE:
+ 	case ACTION_TYPE_KILL:
+ 		return true;
+diff --git a/src/config/rcxml.c b/src/config/rcxml.c
+index 3276124a..c4917a56 100644
+--- a/src/config/rcxml.c
++++ b/src/config/rcxml.c
+@@ -503,6 +503,13 @@ parse_action_args(xmlNode *node, struct action *action)
+ 			struct view_query *query = view_query_create();
+ 			fill_action_query(action, child, query);
+ 			wl_list_append(querylist, &query->link);
++		} else if (!strcasecmp(key, "finalactions")) {
++			struct wl_list *actions = action_get_actionlist(action, "finalactions");
++			if (!actions) {
++				action_arg_add_actionlist(action, "finalactions");
++				actions = action_get_actionlist(action, "finalactions");
++			}
++			append_parsed_actions(child, actions);
+ 		} else if (!strcasecmp(key, "then")) {
+ 			struct wl_list *actions =
+ 				action_get_actionlist(action, "then");
+diff --git a/src/cycle/cycle.c b/src/cycle/cycle.c
+index c687ff44..fc0deec4 100644
+--- a/src/cycle/cycle.c
++++ b/src/cycle/cycle.c
+@@ -4,12 +4,15 @@
+ #include <wlr/types/wlr_scene.h>
+ #include <wlr/util/box.h>
+ #include <wlr/util/log.h>
++#include "action.h"
+ #include "common/lab-scene-rect.h"
+ #include "common/list.h"
++#include "common/macros.h"
+ #include "common/mem.h"
+ #include "common/scene-helpers.h"
+ #include "config/rcxml.h"
+ #include "config/types.h"
++#include "input/keyboard.h"
+ #include "labwc.h"
+ #include "node.h"
+ #include "output.h"
+@@ -39,6 +42,9 @@ update_preview_outlines(struct view *view)
+ 			.nr_borders = 3,
+ 			.border_width = theme->osd_window_switcher_preview_border_width,
+ 		};
++		if (server.cycle.directional) {
++			opts.border_width = opts.border_width < 2 ? 2 : opts.border_width;
++		}
+ 		rect = lab_scene_rect_create(&server.scene->tree, &opts);
+ 		wlr_scene_node_place_above(&rect->tree->node,
+ 			&server.cycle_preview_tree->node);
+@@ -91,6 +97,10 @@ cycle_reinitialize(void)
+ 		/* OSD not active, no need for clean up */
+ 		return;
+ 	}
++	if (cycle->directional) {
++		/* No fixed candidate list or OSD to rebuild. */
++		return;
++	}
+ 
+ 	struct view *selected_view = cycle->selected_view;
+ 	struct view *selected_view_prev =
+@@ -189,11 +199,95 @@ void
+ cycle_step(enum lab_cycle_dir direction)
+ {
+ 	assert(server.input_mode == LAB_INPUT_STATE_CYCLE);
++	if (server.cycle.directional) {
++		return;
++	}
+ 
+ 	server.cycle.selected_view = get_next_selected_view(direction);
+ 	update_cycle();
+ }
+ 
++static bool
++directional_candidate(struct view *view)
++{
++	if (!view->surface || (!view->mapped && !view->minimized)
++			|| (!view->visible_on_all_workspaces
++				&& view->workspace != server.workspaces.current)) {
++		return false;
++	}
++	enum view_wants_focus wants_focus = view_wants_focus(view);
++	if (wants_focus != VIEW_WANTS_FOCUS_ALWAYS
++			&& wants_focus != VIEW_WANTS_FOCUS_LIKELY) {
++		return false;
++	}
++	/* Layer-shell panels are not views; exclude XWayland docks/desktops too. */
++	if (view->impl->contains_window_type
++			&& (view->impl->contains_window_type(view, LAB_WINDOW_TYPE_DOCK)
++				|| view->impl->contains_window_type(view,
++					LAB_WINDOW_TYPE_DESKTOP))) {
++		return false;
++	}
++	return true;
++}
++
++static void
++handle_directional_selected_destroy(struct wl_listener *listener, void *data)
++{
++	cycle_finish(/*switch_focus*/ false);
++}
++
++static void
++directional_select(struct view *view)
++{
++	struct cycle_state *cycle = &server.cycle;
++	if (cycle->selected_destroy.link.next) {
++		wl_list_remove(&cycle->selected_destroy.link);
++	}
++	cycle->selected_view = view;
++	cycle->selected_destroy.notify = handle_directional_selected_destroy;
++	wl_signal_add(&view->events.destroy, &cycle->selected_destroy);
++	update_preview_outlines(view);
++}
++
++void
++cycle_directional(enum lab_directional_cycle_dir direction,
++		struct wl_list *final_actions)
++{
++	struct cycle_state *cycle = &server.cycle;
++	if (server.input_mode == LAB_INPUT_STATE_PASSTHROUGH) {
++		if (!server.active_view || !directional_candidate(server.active_view)) {
++			return;
++		}
++		cycle->directional = true;
++		cycle->final_actions = final_actions;
++		directional_select(server.active_view);
++		seat_focus_override_begin(&server.seat,
++			LAB_INPUT_STATE_CYCLE, LAB_CURSOR_DEFAULT);
++		keyboard_cancel_all_keybind_repeats(&server.seat);
++	} else if (server.input_mode != LAB_INPUT_STATE_CYCLE || !cycle->directional) {
++		return;
++	}
++
++	struct view *best = NULL, *view;
++	struct directional_cycle_distance best_distance = {0}, distance;
++	wl_list_for_each(view, &server.views, link) {
++		if (view == cycle->selected_view || !directional_candidate(view)) {
++			continue;
++		}
++		if (!directional_cycle_get_distance(&cycle->selected_view->current,
++				&view->current, direction, view->focus_id, &distance)) {
++			continue;
++		}
++		if (!best || directional_cycle_is_closer(&distance, &best_distance)) {
++			best = view;
++			best_distance = distance;
++		}
++	}
++	if (best) {
++		directional_select(best);
++	}
++}
++
+ void
+ cycle_finish(bool switch_focus)
+ {
+@@ -202,14 +296,33 @@ cycle_finish(bool switch_focus)
+ 	}
+ 
+ 	struct view *selected_view = server.cycle.selected_view;
++	bool directional = server.cycle.directional;
++	struct wl_list *final_actions = server.cycle.final_actions;
+ 	destroy_cycle();
+ 
+-	seat_focus_override_end(&server.seat, /*restore_focus*/ !switch_focus);
++	seat_focus_override_end(&server.seat,
++		/*restore_focus*/ directional || !switch_focus);
+ 
+ 	/* Hiding OSD may need a cursor change */
+ 	cursor_update_focus();
+ 
+ 	if (switch_focus && selected_view) {
++		if (directional) {
++			if (final_actions) {
++				actions_run(selected_view, final_actions, NULL);
++			} else {
++				struct wl_list defaults;
++				wl_list_init(&defaults);
++				static const char *const names[] = { "Focus", "Raise", "Unshade" };
++				for (size_t i = 0; i < ARRAY_SIZE(names); ++i) {
++					struct action *action = action_create(names[i]);
++					wl_list_append(&defaults, &action->link);
++				}
++				actions_run(selected_view, &defaults, NULL);
++				action_list_free(&defaults);
++			}
++			return;
++		}
+ 		if (rc.window_switcher.unshade) {
+ 			view_set_shade(selected_view, false);
+ 		}
+@@ -479,6 +592,9 @@ update_cycle(void)
+ static void
+ destroy_cycle(void)
+ {
++	if (server.cycle.selected_destroy.link.next) {
++		wl_list_remove(&server.cycle.selected_destroy.link);
++	}
+ 	struct cycle_osd_output *osd_output, *tmp;
+ 	wl_list_for_each_safe(osd_output, tmp, &server.cycle.osd_outputs, link) {
+ 		/* calls handle_osd_tree_destroy() */
+diff --git a/src/cycle/directional.c b/src/cycle/directional.c
+new file mode 100644
+index 00000000..081a7e33
+--- /dev/null
++++ b/src/cycle/directional.c
+@@ -0,0 +1,61 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "cycle-directional.h"
++
++bool
++directional_cycle_get_distance(const struct wlr_box *from,
++		const struct wlr_box *to, enum lab_directional_cycle_dir direction,
++		uint64_t focus_id, struct directional_cycle_distance *distance)
++{
++	if (from->width <= 0 || from->height <= 0
++			|| to->width <= 0 || to->height <= 0) {
++		return false;
++	}
++
++	int64_t dx = (int64_t)to->x * 2 + to->width
++		- ((int64_t)from->x * 2 + from->width);
++	int64_t dy = (int64_t)to->y * 2 + to->height
++		- ((int64_t)from->y * 2 + from->height);
++	int64_t axis, perpendicular;
++	switch (direction) {
++	case LAB_DIRECTIONAL_CYCLE_NORTH:
++		axis = -dy;
++		perpendicular = dx;
++		break;
++	case LAB_DIRECTIONAL_CYCLE_SOUTH:
++		axis = dy;
++		perpendicular = dx;
++		break;
++	case LAB_DIRECTIONAL_CYCLE_EAST:
++		axis = dx;
++		perpendicular = dy;
++		break;
++	case LAB_DIRECTIONAL_CYCLE_WEST:
++		axis = -dx;
++		perpendicular = dy;
++		break;
++	default:
++		return false;
++	}
++	if (axis <= 0) {
++		return false;
++	}
++	*distance = (struct directional_cycle_distance) {
++		.axis = axis,
++		.perpendicular = perpendicular < 0 ? -perpendicular : perpendicular,
++		.focus_id = focus_id,
++	};
++	return true;
++}
++
++bool
++directional_cycle_is_closer(const struct directional_cycle_distance *a,
++		const struct directional_cycle_distance *b)
++{
++	if (a->axis != b->axis) {
++		return a->axis < b->axis;
++	}
++	if (a->perpendicular != b->perpendicular) {
++		return a->perpendicular < b->perpendicular;
++	}
++	return a->focus_id > b->focus_id;
++}
+diff --git a/src/cycle/meson.build b/src/cycle/meson.build
+index db244520..2a65cb6e 100644
+--- a/src/cycle/meson.build
++++ b/src/cycle/meson.build
+@@ -1,5 +1,6 @@
+ labwc_sources += files(
+   'cycle.c',
++  'directional.c',
+   'osd-classic.c',
+   'osd-field.c',
+   'osd-scroll.c',
+diff --git a/src/input/keyboard.c b/src/input/keyboard.c
+index 78cb3e51..08f82e5f 100644
+--- a/src/input/keyboard.c
++++ b/src/input/keyboard.c
+@@ -28,6 +28,7 @@
+ enum lab_key_handled {
+ 	LAB_KEY_HANDLED_FALSE = 0,
+ 	LAB_KEY_HANDLED_TRUE = 1,
++	LAB_KEY_HANDLED_TRUE_NO_REPEAT,
+ 	LAB_KEY_HANDLED_TRUE_AND_VT_CHANGED,
+ };
+ 
+@@ -479,6 +480,10 @@ handle_cycle_view_key(struct keyinfo *keyinfo)
+ 			cycle_finish(/*switch_focus*/ false);
+ 			return true;
+ 		}
++		if (server.cycle.directional) {
++			/* Directional navigation follows configured bindings, not OSD arrows. */
++			continue;
++		}
+ 		if (keyinfo->translated.syms[i] == XKB_KEY_Up
+ 				|| keyinfo->translated.syms[i] == XKB_KEY_Left) {
+ 			/* Up/Left cycles the window backward */
+@@ -549,6 +554,7 @@ handle_compositor_keybindings(struct keyboard *keyboard,
+ 	 */
+ 	cur_keybind = match_keybinding(&keyinfo, keyboard->is_virtual);
+ 	if (cur_keybind && (!locked || cur_keybind->allow_when_locked)) {
++		bool no_repeat = actions_contain_directional_cycle(&cur_keybind->actions);
+ 		/*
+ 		 * Update key-state before action_run() because the action
+ 		 * might lead to seat_focus() in which case we pass the
+@@ -558,7 +564,7 @@ handle_compositor_keybindings(struct keyboard *keyboard,
+ 		if (!cur_keybind->on_release) {
+ 			actions_run(NULL, &cur_keybind->actions, NULL);
+ 		}
+-		return LAB_KEY_HANDLED_TRUE;
++		return no_repeat ? LAB_KEY_HANDLED_TRUE_NO_REPEAT : LAB_KEY_HANDLED_TRUE;
+ 	}
+ 
+ 	return LAB_KEY_HANDLED_FALSE;
+@@ -655,6 +661,8 @@ handle_key(struct wl_listener *listener, void *data)
+ 		 * keybinds and it messes up modifier-onRelease-keybinds.
+ 		 */
+ 		if (!is_modifier(keyboard->wlr_keyboard, event->keycode)
++				&& handled != LAB_KEY_HANDLED_TRUE_NO_REPEAT
++				&& !server.cycle.directional
+ 				&& event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+ 			start_keybind_repeat(keyboard, event);
+ 		}
+diff --git a/src/server.c b/src/server.c
+index e1a91eca..03bf00ba 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -88,6 +88,8 @@
+ static void
+ reload_config_and_theme(void)
+ {
++	/* Cycling may borrow final actions from the configuration being replaced. */
++	cycle_finish(/*switch_focus*/ false);
+ 	/* Avoid UAF when dialog client is used during reconfigure */
+ 	action_prompts_destroy();
+ 
+@@ -114,7 +116,6 @@ reload_config_and_theme(void)
+ 		view_reload_ssd(view);
+ 	}
+ 
+-	cycle_finish(/*switch_focus*/ false);
+ 	menu_reconfigure();
+ 	seat_reconfigure();
+ 	regions_reconfigure();
+diff --git a/src/view-impl-common.c b/src/view-impl-common.c
+index 092ca55f..ef37f07e 100644
+--- a/src/view-impl-common.c
++++ b/src/view-impl-common.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* view-impl-common.c: common code for shell view->impl functions */
+ #include "view-impl-common.h"
++#include "cycle.h"
+ #include "foreign-toplevel/foreign.h"
+ #include "labwc.h"
+ #include "view.h"
+@@ -44,6 +45,10 @@ view_impl_map(struct view *view)
+ void
+ view_impl_unmap(struct view *view)
+ {
++	if (server.cycle.directional && server.cycle.selected_view == view
++			&& !view->minimized) {
++		cycle_finish(/*switch_focus*/ false);
++	}
+ 	view_update_visibility(view);
+ 
+ 	/*
+diff --git a/src/view.c b/src/view.c
+index 21005f20..5acc24d8 100644
+--- a/src/view.c
++++ b/src/view.c
+@@ -463,6 +463,10 @@ void
+ view_set_activated(struct view *view, bool activated)
+ {
+ 	assert(view);
++	static uint64_t next_focus_id;
++	if (activated) {
++		view->focus_id = ++next_focus_id;
++	}
+ 	ssd_set_active(view->ssd, activated);
+ 	if (view->impl->set_activated) {
+ 		view->impl->set_activated(view, activated);
+diff --git a/t/directional-cycle-client.c b/t/directional-cycle-client.c
+new file mode 100644
+index 00000000..c979615d
+--- /dev/null
++++ b/t/directional-cycle-client.c
+@@ -0,0 +1,359 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Headless integration client: real xdg windows and a virtual keyboard. */
++#define _GNU_SOURCE
++#include <assert.h>
++#include <linux/input-event-codes.h>
++#include <signal.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <wayland-client.h>
++#include <xkbcommon/xkbcommon.h>
++#include "virtual-keyboard-client-protocol.h"
++#include "xdg-shell-client-protocol.h"
++
++static struct wl_display *display;
++static struct wl_compositor *compositor;
++static struct wl_shm *shm;
++static struct wl_seat *seat;
++static struct xdg_wm_base *shell;
++static struct zwp_virtual_keyboard_manager_v1 *manager;
++static struct zwp_virtual_keyboard_v1 *keyboard;
++static unsigned int focused;
++
++struct window {
++	struct wl_surface *surface;
++	struct xdg_surface *xdg;
++	struct xdg_toplevel *toplevel;
++	struct wl_buffer *buffer;
++	unsigned int id;
++	bool mapped;
++};
++
++static struct window windows[4];
++
++static void
++sync_events(void)
++{
++	assert(wl_display_roundtrip(display) >= 0);
++	assert(wl_display_roundtrip(display) >= 0);
++}
++
++static void
++keymap(void *data, struct wl_keyboard *kb, uint32_t format, int fd, uint32_t size)
++{
++	close(fd);
++}
++
++static void
++enter(void *data, struct wl_keyboard *kb, uint32_t serial,
++		struct wl_surface *surface, struct wl_array *keys)
++{
++	focused = 0;
++	for (size_t i = 0; i < 4; ++i) {
++		if (windows[i].surface == surface) {
++			focused = windows[i].id;
++		}
++	}
++}
++
++static void
++leave(void *data, struct wl_keyboard *kb, uint32_t serial, struct wl_surface *surface)
++{
++	focused = 0;
++}
++
++static void
++key(void *data, struct wl_keyboard *kb, uint32_t serial,
++	uint32_t time, uint32_t code, uint32_t state)
++{
++}
++
++static void
++modifiers(void *data, struct wl_keyboard *kb, uint32_t serial,
++	uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group)
++{
++}
++
++static void
++repeat(void *data, struct wl_keyboard *kb, int32_t rate, int32_t delay)
++{
++}
++
++static const struct wl_keyboard_listener keyboard_listener = {
++	.keymap = keymap, .enter = enter, .leave = leave, .key = key,
++	.modifiers = modifiers, .repeat_info = repeat,
++};
++
++static void
++ping(void *data, struct xdg_wm_base *base, uint32_t serial)
++{
++	xdg_wm_base_pong(base, serial);
++}
++
++static const struct xdg_wm_base_listener shell_listener = { .ping = ping };
++
++static void
++global(void *data, struct wl_registry *registry, uint32_t name,
++		const char *interface, uint32_t version)
++{
++	if (!strcmp(interface, "wl_compositor")) {
++		compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 4);
++	} else if (!strcmp(interface, "wl_shm")) {
++		shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
++	} else if (!strcmp(interface, "wl_seat")) {
++		seat = wl_registry_bind(registry, name, &wl_seat_interface, 5);
++	} else if (!strcmp(interface, "xdg_wm_base")) {
++		shell = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
++	} else if (!strcmp(interface, "zwp_virtual_keyboard_manager_v1")) {
++		manager = wl_registry_bind(registry, name,
++			&zwp_virtual_keyboard_manager_v1_interface, 1);
++	}
++}
++
++static void
++global_remove(void *data, struct wl_registry *registry, uint32_t name)
++{
++}
++
++static const struct wl_registry_listener registry_listener = {
++	.global = global, .global_remove = global_remove,
++};
++
++static void
++configure(void *data, struct xdg_surface *surface, uint32_t serial)
++{
++	struct window *window = data;
++	xdg_surface_ack_configure(surface, serial);
++	if (!window->mapped) {
++		wl_surface_attach(window->surface, window->buffer, 0, 0);
++		wl_surface_damage(window->surface, 0, 0, 100, 100);
++		window->mapped = true;
++	}
++	wl_surface_commit(window->surface);
++}
++
++static const struct xdg_surface_listener surface_listener = { .configure = configure };
++
++static void
++toplevel_configure(void *data, struct xdg_toplevel *toplevel,
++	int32_t width, int32_t height, struct wl_array *states)
++{
++}
++
++static void
++toplevel_close(void *data, struct xdg_toplevel *toplevel)
++{
++}
++
++static const struct xdg_toplevel_listener toplevel_listener = {
++	.configure = toplevel_configure, .close = toplevel_close,
++};
++
++static void
++create_window(unsigned int index)
++{
++	struct window *window = &windows[index];
++	window->id = index + 1;
++	window->surface = wl_compositor_create_surface(compositor);
++	window->xdg = xdg_wm_base_get_xdg_surface(shell, window->surface);
++	xdg_surface_add_listener(window->xdg, &surface_listener, window);
++	window->toplevel = xdg_surface_get_toplevel(window->xdg);
++	xdg_toplevel_add_listener(window->toplevel, &toplevel_listener, window);
++	char name[32];
++	snprintf(name, sizeof(name), "directional-test-%u", window->id);
++	xdg_toplevel_set_app_id(window->toplevel, name);
++	xdg_toplevel_set_title(window->toplevel, name);
++	int fd = memfd_create("directional-test-buffer", 0);
++	assert(fd >= 0 && ftruncate(fd, 100 * 100 * 4) == 0);
++	struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, 100 * 100 * 4);
++	window->buffer = wl_shm_pool_create_buffer(pool, 0, 100, 100, 400,
++		WL_SHM_FORMAT_XRGB8888);
++	wl_shm_pool_destroy(pool);
++	close(fd);
++	wl_surface_commit(window->surface);
++	for (int i = 0; i < 10; ++i) {
++		sync_events();
++		usleep(10000);
++	}
++	assert(focused == window->id);
++}
++
++static void
++send_key(uint32_t code, bool pressed)
++{
++	static uint32_t time;
++	zwp_virtual_keyboard_v1_key(keyboard, ++time, code,
++		pressed ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
++	sync_events();
++}
++
++static void
++tap(uint32_t code)
++{
++	send_key(code, true);
++	send_key(code, false);
++}
++
++static void
++set_modifiers(bool super, bool shift)
++{
++	struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
++	struct xkb_keymap *map = xkb_keymap_new_from_names(context, NULL,
++		XKB_KEYMAP_COMPILE_NO_FLAGS);
++	uint32_t mask = (super ? 1u << xkb_keymap_mod_get_index(map, XKB_MOD_NAME_LOGO) : 0)
++		| (shift ? 1u << xkb_keymap_mod_get_index(map, XKB_MOD_NAME_SHIFT) : 0);
++	zwp_virtual_keyboard_v1_modifiers(keyboard, mask, 0, 0, 0);
++	xkb_keymap_unref(map);
++	xkb_context_unref(context);
++	sync_events();
++}
++
++static void
++check_focus(unsigned int expected, const char *description)
++{
++	if (focused != expected) {
++		fprintf(stderr, "%s: expected focus %u, got %u\n", description, expected, focused);
++		exit(1);
++	}
++	printf("PASS: %s\n", description);
++}
++
++int
++main(void)
++{
++	display = wl_display_connect(NULL);
++	assert(display);
++	struct wl_registry *registry = wl_display_get_registry(display);
++	wl_registry_add_listener(registry, &registry_listener, NULL);
++	sync_events();
++	assert(compositor && shm && seat && shell && manager);
++	xdg_wm_base_add_listener(shell, &shell_listener, NULL);
++	keyboard = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(manager, seat);
++	struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
++	struct xkb_keymap *map = xkb_keymap_new_from_names(context, NULL,
++		XKB_KEYMAP_COMPILE_NO_FLAGS);
++	char *text = xkb_keymap_get_as_string(map, XKB_KEYMAP_FORMAT_TEXT_V1);
++	int fd = memfd_create("directional-test-keymap", 0);
++	assert(fd >= 0 && write(fd, text, strlen(text) + 1) == (ssize_t)strlen(text) + 1);
++	zwp_virtual_keyboard_v1_keymap(keyboard, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
++		fd, strlen(text) + 1);
++	close(fd);
++	free(text);
++	xkb_keymap_unref(map);
++	xkb_context_unref(context);
++	sync_events();
++	struct wl_keyboard *observer = wl_seat_get_keyboard(seat);
++	wl_keyboard_add_listener(observer, &keyboard_listener, NULL);
++	sync_events();
++	/* Three horizontal windows, then a fourth below the rightmost window. */
++	for (unsigned int i = 0; i < 4; ++i) {
++		create_window(i);
++	}
++	set_modifiers(true, false);
++	tap(KEY_UP);
++	check_focus(0, "selection does not focus before modifier release");
++	set_modifiers(false, false);
++	check_focus(3, "north commits the window above");
++	set_modifiers(true, false);
++	tap(KEY_RIGHT);
++	set_modifiers(false, false);
++	check_focus(3, "no candidate keeps current selection");
++	set_modifiers(true, false);
++	tap(KEY_LEFT);
++	tap(KEY_LEFT);
++	set_modifiers(false, false);
++	check_focus(1, "multiple presses step from the selection");
++	set_modifiers(true, false);
++	send_key(KEY_RIGHT, true);
++	usleep(1100000);
++	sync_events();
++	send_key(KEY_RIGHT, false);
++	set_modifiers(false, false);
++	check_focus(2, "holding a direction does not repeat");
++	set_modifiers(true, false);
++	tap(KEY_RIGHT);
++	tap(KEY_ESC);
++	set_modifiers(false, false);
++	check_focus(2, "Escape cancels without changing focus");
++	set_modifiers(true, false);
++	tap(KEY_RIGHT);
++	set_modifiers(true, true);
++	set_modifiers(false, true);
++	check_focus(0, "remaining modifier keeps selection open");
++	set_modifiers(false, false);
++	check_focus(3, "last modifier commits selection");
++	/* W-m minimizes the focused window, leaving window 2 focused. */
++	set_modifiers(true, false);
++	tap(KEY_M);
++	set_modifiers(false, false);
++	check_focus(2, "test window minimized");
++	set_modifiers(true, false);
++	tap(KEY_RIGHT);
++	set_modifiers(false, false);
++	check_focus(3, "minimized window is selected and restored on commit");
++	/* W-e selects west with an explicitly empty finalactions list. */
++	set_modifiers(true, false);
++	tap(KEY_E);
++	set_modifiers(false, false);
++	check_focus(3, "empty finalactions keeps original focus");
++	/* W-f selects west with Focus alone, replacing the defaults. */
++	set_modifiers(true, false);
++	tap(KEY_F);
++	set_modifiers(false, false);
++	check_focus(2, "custom finalactions focus the selected window");
++	set_modifiers(true, false);
++	tap(KEY_E);
++	tap(KEY_RIGHT);
++	set_modifiers(false, false);
++	check_focus(2, "first binding supplies finalactions throughout selection");
++	set_modifiers(true, false);
++	send_key(KEY_RIGHT, true);
++	set_modifiers(false, false);
++	check_focus(0, "modifier released first waits for the bound key release");
++	send_key(KEY_RIGHT, false);
++	check_focus(3, "releasing the bound key completes modifier-first selection");
++	set_modifiers(true, false);
++	tap(KEY_LEFT);
++	set_modifiers(false, false);
++	check_focus(2, "west returns to the middle window");
++	set_modifiers(true, false);
++	tap(KEY_E);
++	const char *server_pid = getenv("LABWC_TEST_SERVER_PID");
++	assert(server_pid && kill(atoi(server_pid), SIGHUP) == 0);
++	usleep(100000);
++	sync_events();
++	set_modifiers(false, false);
++	check_focus(2, "configuration reload cancels borrowed finalactions safely");
++	set_modifiers(true, false);
++	tap(KEY_RIGHT);
++	xdg_toplevel_destroy(windows[2].toplevel);
++	xdg_surface_destroy(windows[2].xdg);
++	wl_surface_destroy(windows[2].surface);
++	windows[2].surface = NULL;
++	sync_events();
++	set_modifiers(false, false);
++	check_focus(2, "closing the selected window cancels safely");
++	/* Alt-Tab still enters and commits ordinary cycling. */
++	uint32_t alt = 1u << 3; /* Mod1 in the default keymap. */
++	zwp_virtual_keyboard_v1_modifiers(keyboard, alt, 0, 0, 0);
++	sync_events();
++	tap(KEY_TAB);
++	check_focus(0, "ordinary Alt-Tab still opens selection");
++	set_modifiers(false, false);
++	assert(focused != 0);
++	puts("PASS: ordinary Alt-Tab still commits");
++	set_modifiers(true, false);
++	tap(KEY_U);
++	set_modifiers(false, false);
++	check_focus(0, "test clears keyboard focus");
++	set_modifiers(true, false);
++	tap(KEY_RIGHT);
++	set_modifiers(false, false);
++	check_focus(0, "no focused window does nothing");
++	wl_display_disconnect(display);
++	return 0;
++}
+diff --git a/t/directional-cycle-integration.py b/t/directional-cycle-integration.py
+new file mode 100644
+index 00000000..b531e243
+--- /dev/null
++++ b/t/directional-cycle-integration.py
+@@ -0,0 +1,116 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Compile a Wayland test client and test labwc on an isolated headless output.
++
++Usage: python3 t/directional-cycle-integration.py build/labwc
++Requires cc, pkg-config, wayland-scanner, wayland-client and xkbcommon.
++"""
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import time
++
++# Only the virtual-keyboard requests used by the test client are needed.
++VIRTUAL_KEYBOARD = """<protocol name="virtual_keyboard_unstable_v1">
++  <interface name="zwp_virtual_keyboard_v1" version="1">
++    <request name="keymap"><arg name="format" type="uint"/>
++      <arg name="fd" type="fd"/><arg name="size" type="uint"/></request>
++    <request name="key"><arg name="time" type="uint"/>
++      <arg name="key" type="uint"/><arg name="state" type="uint"/></request>
++    <request name="modifiers"><arg name="mods_depressed" type="uint"/>
++      <arg name="mods_latched" type="uint"/><arg name="mods_locked" type="uint"/>
++      <arg name="group" type="uint"/></request>
++    <request name="destroy" type="destructor"/>
++  </interface>
++  <interface name="zwp_virtual_keyboard_manager_v1" version="1">
++    <request name="create_virtual_keyboard">
++      <arg name="seat" type="object" interface="wl_seat"/>
++      <arg name="id" type="new_id" interface="zwp_virtual_keyboard_v1"/>
++    </request>
++  </interface>
++</protocol>"""
++
++
++def main():
++    binary = Path(sys.argv[1]).resolve()
++    source = Path(__file__).with_name("directional-cycle-client.c").resolve()
++    with tempfile.TemporaryDirectory(prefix="labwc-directional-") as directory:
++        root = Path(directory)
++        runtime = root / "runtime"
++        runtime.mkdir(mode=0o700)
++        config = root / "config"
++        config.mkdir()
++        bindings = ""
++        for key, direction in [("Up", "north"), ("Down", "south"),
++                               ("Left", "west"), ("Right", "east")]:
++            bindings += (f'<keybind key="W-{key}"><action name="DirectionalCycleWindows">'
++                         f'<direction>{direction}</direction></action></keybind>')
++        rules = ""
++        for number, (x, y) in enumerate([(100, 100), (300, 100),
++                                        (500, 100), (500, 300)], start=1):
++            rules += (f'<windowRule identifier="directional-test-{number}">'
++                      f'<action name="MoveTo" x="{x}" y="{y}" /></windowRule>')
++        (config / "rc.xml").write_text(f"""<labwc_config>
++          <keyboard><repeatRate>50</repeatRate><repeatDelay>100</repeatDelay>
++            {bindings}
++            <keybind key="W-m"><action name="Iconify"/></keybind>
++            <keybind key="W-u"><action name="Unfocus"/></keybind>
++            <keybind key="W-e"><action name="DirectionalCycleWindows" direction="west">
++              <finalactions/></action></keybind>
++            <keybind key="W-f"><action name="DirectionalCycleWindows" direction="west">
++              <finalactions><action name="Focus"/></finalactions></action></keybind>
++            <keybind key="A-Tab"><action name="NextWindow"/></keybind>
++          </keyboard><windowRules>{rules}</windowRules>
++        </labwc_config>""")
++        (config / "autostart").write_text("")
++        (config / "shutdown").write_text("")
++        xml = root / "virtual-keyboard.xml"
++        xml.write_text(VIRTUAL_KEYBOARD)
++        protocols = subprocess.check_output(
++            ["pkg-config", "--variable=pkgdatadir", "wayland-protocols"], text=True).strip()
++        for name, path in [("virtual-keyboard", xml),
++                           ("xdg-shell", Path(protocols) / "stable/xdg-shell/xdg-shell.xml")]:
++            subprocess.run(["wayland-scanner", "client-header", str(path),
++                            str(root / f"{name}-client-protocol.h")], check=True)
++            subprocess.run(["wayland-scanner", "private-code", str(path),
++                            str(root / f"{name}-protocol.c")], check=True)
++        flags = subprocess.check_output(
++            ["pkg-config", "--cflags", "--libs", "wayland-client", "xkbcommon"],
++            text=True).split()
++        client = root / "client"
++        subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Wno-unused-parameter",
++                        "-UNDEBUG", "-I", str(root), str(source),
++                        str(root / "xdg-shell-protocol.c"),
++                        str(root / "virtual-keyboard-protocol.c"), "-o", str(client),
++                        *flags], check=True)
++        env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY="wayland-0",
++                   WLR_BACKENDS="headless", WLR_RENDERER="pixman",
++                   WLR_HEADLESS_OUTPUTS="1", LABWC_UPDATE_ACTIVATION_ENV="0",
++                   XKB_DEFAULT_LAYOUT="us", XKB_DEFAULT_VARIANT="",
++                   XKB_DEFAULT_OPTIONS="")
++        env.pop("WAYLAND_SOCKET", None)
++        with (root / "server.log").open("w+") as log:
++            server = subprocess.Popen([str(binary), "-C", str(config), "-d"],
++                                      env=env, stdout=log, stderr=log)
++            env["LABWC_TEST_SERVER_PID"] = str(server.pid)
++            try:
++                for _ in range(100):
++                    if (runtime / "wayland-0").exists() or server.poll() is not None:
++                        break
++                    time.sleep(0.05)
++                subprocess.run([str(client)], env=env, check=True, timeout=30)
++            except Exception:
++                log.seek(0)
++                print(log.read(), file=sys.stderr)
++                raise
++            finally:
++                server.terminate()
++                server.wait(timeout=10)
++            if server.returncode != 0:
++                raise RuntimeError(f"labwc exited with {server.returncode}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/t/directional-cycle.c b/t/directional-cycle.c
+new file mode 100644
+index 00000000..e8ff98a8
+--- /dev/null
++++ b/t/directional-cycle.c
+@@ -0,0 +1,118 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <assert.h>
++#include <limits.h>
++#include <stddef.h>
++#include "cycle-directional.h"
++
++static void
++test_directions(void)
++{
++	struct wlr_box origin = { 100, 100, 100, 100 };
++	struct wlr_box targets[] = {
++		{ 100, 99, 100, 100 }, { 100, 101, 100, 100 },
++		{ 101, 100, 100, 100 }, { 99, 100, 100, 100 },
++	};
++	for (int direction = 0; direction < 4; ++direction) {
++		struct directional_cycle_distance distance;
++		assert(!directional_cycle_get_distance(&origin, &origin,
++			direction, 0, &distance));
++		for (int target = 0; target < 4; ++target) {
++			bool eligible = directional_cycle_get_distance(&origin,
++				&targets[target], direction, 7, &distance);
++			assert(eligible == (direction == target));
++			if (eligible) {
++				assert(distance.axis == 2);
++				assert(distance.perpendicular == 0);
++				assert(distance.focus_id == 7);
++			}
++		}
++	}
++}
++
++static void
++test_centers_and_extremes(void)
++{
++	struct wlr_box from = { 0, 0, 100, 100 };
++	struct wlr_box to = { -50, -50, 201, 201 };
++	struct directional_cycle_distance distance;
++	/* A containing, overlapping window can be half a pixel farther east. */
++	assert(directional_cycle_get_distance(&from, &to,
++		LAB_DIRECTIONAL_CYCLE_EAST, 0, &distance));
++	assert(distance.axis == 1 && distance.perpendicular == 1);
++	to.width = 200;
++	to.height = 200;
++	assert(!directional_cycle_get_distance(&from, &to,
++		LAB_DIRECTIONAL_CYCLE_EAST, 0, &distance));
++	to.width = 0;
++	assert(!directional_cycle_get_distance(&from, &to,
++		LAB_DIRECTIONAL_CYCLE_EAST, 0, &distance));
++	from = (struct wlr_box) { INT_MIN, INT_MIN, 1, 1 };
++	to = (struct wlr_box) { INT_MAX, INT_MAX, INT_MAX, INT_MAX };
++	assert(directional_cycle_get_distance(&from, &to,
++		LAB_DIRECTIONAL_CYCLE_EAST, 0, &distance));
++	assert(distance.axis > INT_MAX);
++	assert(distance.axis == distance.perpendicular);
++	assert(!directional_cycle_get_distance(&from, &to, -1, 0, &distance));
++}
++
++static void
++test_ranking(void)
++{
++	struct directional_cycle_distance a = { 1, 2000, 1 };
++	struct directional_cycle_distance b = { 2, 0, 9 };
++	assert(directional_cycle_is_closer(&a, &b));
++	assert(!directional_cycle_is_closer(&b, &a));
++	b.axis = 1;
++	assert(directional_cycle_is_closer(&b, &a));
++	a.perpendicular = 0;
++	assert(directional_cycle_is_closer(&b, &a));
++	a.focus_id = b.focus_id;
++	assert(!directional_cycle_is_closer(&a, &b));
++}
++
++static size_t
++select_next(const struct wlr_box *windows, size_t count, size_t selected,
++		enum lab_directional_cycle_dir direction)
++{
++	size_t best = selected;
++	struct directional_cycle_distance best_distance = {0}, distance;
++	for (size_t i = 0; i < count; ++i) {
++		if (directional_cycle_get_distance(&windows[selected], &windows[i],
++				direction, i, &distance)
++				&& (best == selected
++					|| directional_cycle_is_closer(&distance,
++						&best_distance))) {
++			best = i;
++			best_distance = distance;
++		}
++	}
++	return best;
++}
++
++static void
++test_navigation(void)
++{
++	struct wlr_box windows[] = {
++		{ -300, 0, 100, 100 },
++		{ -200, 2000, 100, 100 },
++		{ 0, 0, 100, 100 },
++		{ 0, 100, 100, 100 },
++	};
++	assert(select_next(windows, 4, 0, LAB_DIRECTIONAL_CYCLE_WEST) == 0);
++	assert(select_next(windows, 4, 0, LAB_DIRECTIONAL_CYCLE_EAST) == 1);
++	assert(select_next(windows, 4, 1, LAB_DIRECTIONAL_CYCLE_EAST) == 3);
++	assert(select_next(windows, 4, 3, LAB_DIRECTIONAL_CYCLE_EAST) == 3);
++	assert(select_next(windows, 4, 3, LAB_DIRECTIONAL_CYCLE_NORTH) == 2);
++	assert(select_next(windows, 4, 2, LAB_DIRECTIONAL_CYCLE_WEST) == 1);
++	assert(select_next(windows, 1, 0, LAB_DIRECTIONAL_CYCLE_EAST) == 0);
++}
++
++int
++main(void)
++{
++	test_directions();
++	test_centers_and_extremes();
++	test_ranking();
++	test_navigation();
++	return 0;
++}
+diff --git a/t/meson.build b/t/meson.build
+index e64fcff9..ac37b4b8 100644
+--- a/t/meson.build
++++ b/t/meson.build
+@@ -1,3 +1,13 @@
++# The geometry test has no cmocka dependency and can run with -Dtest=auto.
++test('directional-cycle', executable(
++  'test_directional_cycle',
++  sources: ['directional-cycle.c', '../src/cycle/directional.c'],
++  include_directories: [labwc_inc],
++  dependencies: [wlroots],
++  c_args: ['-UNDEBUG'],
++))
++
++if dep_cmocka.found()
+ test_deps = [
+   dep_cmocka,
+   input,
+@@ -41,3 +51,4 @@ foreach t : tests
+     is_parallel: false,
+   )
+ endforeach
++endif

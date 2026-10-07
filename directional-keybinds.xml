@@ -1,0 +1,21 @@
+<!-- Example of keybinds to put into rc.xml -->
+<keybind key="W-Up">
+  <action name="DirectionalCycleWindows">
+    <direction>north</direction>
+  </action>
+</keybind>
+<keybind key="W-Down">
+  <action name="DirectionalCycleWindows">
+    <direction>south</direction>
+  </action>
+</keybind>
+<keybind key="W-Left">
+  <action name="DirectionalCycleWindows">
+    <direction>west</direction>
+  </action>
+</keybind>
+<keybind key="W-Right">
+  <action name="DirectionalCycleWindows">
+    <direction>east</direction>
+  </action>
+</keybind>

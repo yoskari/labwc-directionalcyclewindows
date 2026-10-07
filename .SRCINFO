@@ -1,0 +1,41 @@
+pkgbase = labwc-directional
+	pkgdesc = Openbox-inspired Wayland compositor with directional window cycling
+	pkgver = 0.20.2.r30.gfa6794a3
+	pkgrel = 1
+	url = https://github.com/labwc/labwc
+	arch = x86_64
+	license = GPL-2.0-only
+	checkdepends = python
+	makedepends = git
+	makedepends = meson
+	makedepends = scdoc
+	makedepends = wayland-protocols
+	makedepends = xorg-xwayland
+	depends = cairo
+	depends = glib2
+	depends = glibc
+	depends = libinput
+	depends = libpng
+	depends = librsvg
+	depends = libsfdo
+	depends = libwlroots-0.20.so
+	depends = libxcb
+	depends = libxkbcommon
+	depends = libxml2
+	depends = pango
+	depends = pixman
+	depends = seatd
+	depends = ttf-font
+	depends = wayland
+	optdepends = bemenu: default launcher via Alt+F3
+	optdepends = xorg-xwayland: X11 application support
+	provides = labwc=0.20.2.r30.gfa6794a3
+	conflicts = labwc
+	source = labwc::git+https://github.com/labwc/labwc.git#commit=fa6794a3d29593faf088447c30c1e9dd86cb94ed
+	source = directional-cycle.patch
+	source = directional-keybinds.xml
+	sha256sums = SKIP
+	sha256sums = c16eb28271bb86e564b56c7b336ce9e549f027af40ec81ca1aeb03a25f36f3c2
+	sha256sums = 3b634f08f1367df6b74b012ea5aead334522d332b88a31be54c000377c38b452
+
+pkgname = labwc-directional

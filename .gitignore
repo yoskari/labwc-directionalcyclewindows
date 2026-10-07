@@ -1,0 +1,7 @@
+# makepkg's downloaded source cache and build directories
+/labwc/
+/src/
+/pkg/
+/*.pkg.tar.*
+/*.log
+tags
