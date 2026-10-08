@@ -14,12 +14,12 @@ repository updates do not replace this differently named package.
 - Upstream: https://github.com/labwc/labwc
 - Base commit: `fa6794a3d29593faf088447c30c1e9dd86cb94ed`
 - Base version: labwc 0.20.2 plus 30 upstream commits
-- Feature commit: `0aac8e8cfe33da75e24d15d5d8ee740f796f6153`
+- Patch: directional cycling with Openbox-style spatial scoring
 - Required wlroots ABI: 0.20
 
-The feature commit identifies the patch exported from the development checkout;
-it does not need to exist in the upstream repository. The build downloads only
-the pinned upstream base and applies the patch stored here.
+The patch is exported from the development checkout against the pinned upstream
+base. The build downloads only that upstream base and applies the patch stored
+here; feature commits do not need to exist in the upstream repository.
 
 ## Build
 
@@ -42,7 +42,7 @@ tests run as well.
 Once the build and tests pass:
 
 ```sh
-sudo pacman -U ./labwc-directional-0.20.2.r30.gfa6794a3-1-x86_64.pkg.tar.zst
+sudo pacman -U ./labwc-directional-0.20.2.r30.gfa6794a3-2-x86_64.pkg.tar.zst
 ```
 
 Pacman asks to remove the conflicting `labwc` package in the same transaction.
@@ -60,9 +60,11 @@ default Super-arrow snapping shortcuts. Reload configuration with `labwc --recon
 
 Hold Super and press an arrow once per step. Releasing all modifiers commits
 the selection; Escape cancels. Candidates include minimized windows on the
-current workspace, across all monitors. Selection uses content centers and
-the nearest coordinate along the requested axis. Ties use perpendicular
-distance, then recent focus. There is no wrapping or automatic key repeat.
+current workspace, across all monitors. Selection uses frame centers and ranks
+candidates in the requested half-plane by forward distance plus sideways
+distance. Candidates more than 45 degrees off the requested direction receive
+a penalty of 1,000,000 logical pixels. Equal scores prefer recent focus. There
+is no wrapping or automatic key repeat.
 
 By default, selection runs `Focus`, `Raise`, and `Unshade`. A binding can replace
 those defaults with a `<finalactions>` list. An empty list runs nothing. The
@@ -93,18 +95,18 @@ the new version has been tested in a real session.
 
 For an upstream labwc update:
 
-1. In the development checkout, rebase the feature commit onto the chosen new
+1. In the development checkout, rebase the feature commits onto the chosen new
    upstream revision, resolve conflicts, and test the resulting compositor.
-2. Export the feature commit from that checkout:
+2. Export the complete feature patch from that checkout, replacing
+   `UPSTREAM_BASE` with the chosen upstream revision:
 
    ```sh
-   git format-patch -1 --stdout --no-signature > /path/to/this/repo/directional-cycle.patch
+   git diff --binary UPSTREAM_BASE -- . > /path/to/this/repo/directional-cycle.patch
    ```
 
-3. Update `_upstream_commit` to the feature commit's upstream parent, set an
+3. Update `_upstream_commit` to that upstream revision, set an
    appropriate `pkgver`, and reset `pkgrel` to 1. Update the pinned-source
-   details and installation filename in this README too. If the patch spans
-   multiple commits, export the entire feature series rather than only `-1`.
+   details and installation filename in this README too.
 4. Update the checksums and package metadata:
 
    ```sh

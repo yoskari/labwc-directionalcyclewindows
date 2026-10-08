@@ -3,13 +3,13 @@
 
 pkgname=labwc-directional
 pkgver=0.20.2.r30.gfa6794a3
-pkgrel=1
+pkgrel=2
 pkgdesc='Openbox-inspired Wayland compositor with directional window cycling'
 arch=('x86_64')
 url='https://github.com/labwc/labwc'
 license=('GPL-2.0-only')
 
-# Upstream parent of the tested feature commit 0aac8e8c.
+# Upstream base of the tested directional cycling patch.
 # Keep this pinned; changing it requires rebasing and testing the patch.
 _upstream_commit=fa6794a3d29593faf088447c30c1e9dd86cb94ed
 
@@ -48,8 +48,8 @@ source=(
 # Git verifies the pinned commit; the two local files have content checksums.
 sha256sums=(
   'SKIP'
-  'c16eb28271bb86e564b56c7b336ce9e549f027af40ec81ca1aeb03a25f36f3c2'
-  '3b634f08f1367df6b74b012ea5aead334522d332b88a31be54c000377c38b452'
+  '868d578c3bc7af1f827e4f791662726b35d1706409808072ab72964ddd889188'
+  '48ad3a658cb562d3f2c3406c3476c710311d96e77d21d4377518797cb2b28eb5'
 )
 
 prepare() {
